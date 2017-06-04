@@ -1,0 +1,151 @@
+---
+title: "PredictionAssignment"
+author: "Christopher Brodowski"
+date: "May 28, 2017"
+output:
+  html_document: default
+  pdf_document: default
+---
+## Background
+The goal of this project is to predict how the test subjects performed a certain exercise using any other number of variables found in a training data set.
+
+Using devices such as Jawbone Up, Nike FuelBand, and Fitbit it is now possible to collect a large amount of data about personal activity relatively inexpensively. These type of devices are part of the quantified self movement - a group of enthusiasts who take measurements about themselves regularly to improve their health, to find patterns in their behavior, or because they are tech geeks. One thing that people regularly do is quantify how much of a particular activity they do, but they rarely quantify how well they do it. In this project, the goal will be to use data from accelerometers on the belt, forearm, arm, and dumbell of 6 participants. They were asked to perform barbell lifts correctly and incorrectly in 5 different ways. More information is available from the website here: http://groupware.les.inf.puc-rio.br/har (see the section on the Weight Lifting Exercise Dataset).
+
+## Load our libraries and set a random seed (used later on)
+```{r}
+set.seed(12345)
+library(RCurl)
+library(data.table)
+library(caret)
+library(parallel)
+library(doParallel)
+library(reshape2)
+library(ggplot2)
+```
+## Download and Reading Data (Preparing)
+
+### Download the data, if needed
+```{r}
+training_url <- url("https://d396qusza40orc.cloudfront.net/predmachlearn/pml-training.csv")
+training_file <- "pml_training.csv"
+if (!file.exists(training_file)) {
+  download.file(training_url, destfile=training_file,
+                method="auto")
+}
+test_url <- url("https://d396qusza40orc.cloudfront.net/predmachlearn/pml-testing.csv")
+test_file <- "pml-testing.csv"
+if (!file.exists(test_file)) {
+  download.file(test_url, destfile=test_file, method="auto")
+}
+```
+### Read the training and testing data into data tables
+```{r}
+inDataTraining <- fread(training_file)
+TestData <- fread(test_file)
+```
+## Identification of Prediction Variables
+As our predictor (i.e. independent) variables should be our inputs to a model, it is preferable that these variables have valid input.  We can either remove invalid/missing inputs from a variety of variables or we can eliminate those with missing data from the start, like the following:
+```{r}
+haveMissing <- sapply(TestData, function (x) any(is.na(x) | x == ""))
+canPredict <- !haveMissing & grepl("belt|[^(fore)]arm|dumbbell|forearm", names(haveMissing))
+predictionPossibilities <- names(haveMissing)[canPredict]
+# We are trying to find belt, arm, dumbbell and forearm variables without missing data
+varToInclude <- c("classe", predictionPossibilities)
+```
+## Subset data to get what we want
+We now have our desired predictor names.  We should now subset the training data set so that we only have the variables we want (i.e., the prediction variables.)
+```{r}
+inDataTraining <- inDataTraining[, varToInclude, with=FALSE]
+dim(inDataTraining)
+names(inDataTraining)
+inDataTraining <- inDataTraining[, classe := factor(inDataTraining[, classe])]
+inDataTraining[, .N, classe]
+```
+We will use 60% of the set for training (therefore, 40% for probing).
+```{r}
+# Update: 70% creates a warning; try 65%?  
+# Update again: 60%
+inTrain <- createDataPartition(inDataTraining$classe, p=0.6)
+dataTraining <- inDataTraining[inTrain[[1]]]
+dataProbed <- inDataTraining[-inTrain[[1]]]
+```
+### Center and scale
+We now need to center and scale the prediction possiblities:
+```{r}
+X <- dataTraining[, predictionPossibilities, with=FALSE]
+preProc <- preProcess(X)
+preProc
+```
+### Predict
+We have our prediction info set up.  Let's predict based on the preprocessed data:
+```{r}
+predictedX <- predict(preProc, X)
+dataTrainingCS <- data.table(data.frame(classe = dataTraining[, classe], predictedX))
+X <- dataProbed[, predictionPossibilities, with=FALSE]
+predictedX <- predict(preProc, X)
+dataProbedCS <- data.table(data.frame(classe = dataProbed[, classe], predictedX))
+nzv <- nearZeroVar(dataTrainingCS, saveMetrics=TRUE)
+if (any(nzv$nzv)) {
+  print("We have one of more variables with nearzero variance!  TODO!")
+}
+```
+## Train model
+Train and implement the model, if it was not already done (since it takes a bit of time to finish.)  
+
+I formed the parallelization bit by following the following links:
+https://www.r-bloggers.com/how-to-go-parallel-in-r-basics-tips/
+https://cran.r-project.org/web/views/HighPerformanceComputing.html
+```{r}
+if (!file.exists("trainModelTemplate2.RData")) {
+  cl <- makeCluster(detectCores() - 1)
+  registerDoParallel(cl)
+  ctrl <- trainControl(classProbs=TRUE,
+                       savePredictions=TRUE,
+                       allowParallel=TRUE)
+  # using random forest method
+  method <- "rf"
+  trainModel <- train(classe ~ ., data=dataTrainingCS, method=method)
+  stopCluster(cl)
+  trainModel
+  hat <- predict(trainModel, dataTrainingCS)
+  confusionMatrix(hat, dataTraining[, classe])
+  hat <- predict(trainModel, dataProbedCS)
+  confusionMatrix(hat, dataProbedCS[, classe])
+  varImp(trainModel)
+  save(trainModel, file="trainModelTemplate2.RData")
+}
+```
+## Check relationship between a few prediction variables
+### Forearm Plot
+```{r}
+cc <- grep("forearm", names(dataTrainingCS))
+cc <- c(cc, which(names(dataTrainingCS) == "classe"))
+melted <- melt(dataTrainingCS[,cc,with=FALSE][,rownum:=seq(1,nrow(dataTrainingCS))], id.vars=c("rownum", "classe"))
+ggplot(melted, aes(x=classe, y=value)) + geom_violin(aes(color=classe, fill=classe),alpha=0.5)
+```
+### Belt plot
+```{r}
+cc <- grep("belt", names(dataTrainingCS))
+cc <- c(cc, which(names(dataTrainingCS) == "classe"))
+melted <- melt(dataTrainingCS[,cc,with=FALSE][,rownum:=seq(1,nrow(dataTrainingCS))], id.vars=c("rownum", "classe"))
+ggplot(melted, aes(x=classe, y=value)) + geom_violin(aes(color=classe, fill=classe),alpha=0.5)
+```
+## Loading Model and writing data
+Whether we had to produce the model fresh or not, let's load it, run the test problems and write the results to files:
+```{r}
+load(file="trainModelTemplate2.RData", verbose=TRUE)
+TestDataCS <- predict(preProc, TestData[, predictionPossibilities, with=FALSE])
+hat <- predict(trainModel, TestDataCS)
+TestData <- cbind(hat, TestData)
+subset(TestData, 
+       select=names(TestData)[grep("belt|[^(fore)]arm|dumbbell|forearm", 
+       names(TestData), invert=TRUE)])
+outPath <- "C:/Users/cbrodows/PredictionAssignment"
+for (iter in 1:length(hat)) {
+  pfilename = paste0("problem_id_", iter, ".txt")
+  write.table(hat[iter],file=file.path(outPath, pfilename), 
+              quote=FALSE, row.names=FALSE, 
+              col.names=FALSE)
+}
+```
+ 
